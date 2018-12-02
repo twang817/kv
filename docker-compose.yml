@@ -1,0 +1,8 @@
+version: '3.2'
+
+services:
+  server:
+    image: memcache-server:latest
+    command: watchmedo auto-restart -d . -p "*.py" -DR -- python main.py
+    volumes:
+      - .:/opt/app
