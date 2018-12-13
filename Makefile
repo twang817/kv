@@ -1,7 +1,8 @@
-all: down image up
+all: down build up
 
-image:
+build:
 	docker build . -t memcache-server
+	docker build -f frontend/Dockerfile -t memcache-frontend frontend
 
 up:
 	docker-compose up
@@ -14,3 +15,6 @@ status:
 
 local:
 	pipenv run watchmedo auto-restart -d . -p "*.py" -DR -- python main.py
+
+test:
+	pipenv run pytest --cov=.

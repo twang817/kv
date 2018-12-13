@@ -4,6 +4,8 @@ verify_ssl = true
 name = "pypi"
 
 [dev-packages]
+pytest = "*"
+pytest-cov = "*"
 
 [packages]
 watchdog = "==0.9.0"

@@ -128,15 +128,16 @@ def main(ctx, db, bind, port):
     conn = sqlite3.connect(db)
 
     logger.info('initializing store')
-    store = Store(ctx.default_map['commit_log'])
-    store.load_db(conn)
+    commit_log = open(ctx.default_map['commit_log'], 'a+b')
+    store = Store(conn, commit_log)
+    store.load_db()
     store.sync_commit_log()
 
     loop = asyncio.get_event_loop()
 
     server = MemcacheServer(store)
     flush_task = loop.create_task(
-        store.flush_loop(conn, ctx.default_map['flush_timeout'])
+        store.flush_loop(timeout=ctx.default_map['flush_timeout'])
     )
 
     metrics_conf = ctx.default_map['metrics']

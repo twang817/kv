@@ -1,5 +1,5 @@
 import asyncio
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from collections.abc import MutableMapping
 import os
 import struct
@@ -50,23 +50,25 @@ FLUSH_ERRORS = Counter('storage_flush_errors', 'Number of errors during flush')
 
 
 class Store(MutableMapping):
-    def __init__(self, commit_log_file):
+    def __init__(self, conn, commit_log):
         self.data = {}
         self.commit_id = None
-        self.commit_log_file = commit_log_file
-        self.commit_log = None
-        self.dirty_keys = set()
-        self.delete_keys = set()
-
-    def reset_dirty(self):
-        self.dirty_keys.clear()
-        self.delete_keys.clear()
+        self.conn = conn
+        self.commit_log = commit_log
+        self.pending_insert = set()
+        self.pending_delete = set()
+        self.pending_update = set()
 
     @property
     def dirty(self):
-        return self.dirty_keys or self.delete_keys
+        return self.pending_insert or self.pending_update or self.pending_delete
 
-    def load_db(self, conn):
+    @property
+    def pending_upsert(self):
+        return self.pending_insert.union(self.pending_update)
+
+    def load_db(self, conn=None):
+        conn = conn or self.conn
         with conn:
             c = conn.cursor()
             c.execute('BEGIN')
@@ -91,33 +93,31 @@ class Store(MutableMapping):
             logger.info('commit_id: {}'.format(self.commit_id))
             c.execute('COMMIT')
 
-    def load_commits(self):
-        if os.path.exists(self.commit_log_file):
-            commit_log = open(self.commit_log_file, 'rb')
-            while True:
-                commit_id = commit_log.read(16)
-                if not commit_id:
-                    break
-                commit_id = uuid.UUID(bytes=commit_id)
-                op = unpack(commit_log, '=H')[0]
-                for command in Command.__subclasses__():
-                    if op == command.opcode:
-                        yield commit_id, command.unpack(commit_log)
-
-    def dump_commit_log(self):
-        logger.debug('commits log: %s', ['%s - %s' % (commit_id, command) for commit_id, command in self.load_commits()])
-
-    def sync_commit_log(self):
+    def sync_commit_log(self, commit_log=None):
+        commit_log = commit_log or self.commit_log
         # replay the commits from the log
-        for commit_id, command in self.load_commits():
+        for commit_id, command in self.load_commits(commit_log):
             logger.info('replaying commit %s - %s', commit_id, command)
             command.visit(self)
             self.commit_id = commit_id
 
-        # start commit log
-        self.commit_log = open(self.commit_log_file, 'ab')
+    def load_commits(self, commit_log=None):
+        commit_log = commit_log or self.commit_log
+        commit_log.seek(0)
+        while True:
+            commit_id = commit_log.read(16)
+            if not commit_id:
+                break
+            commit_id = uuid.UUID(bytes=commit_id)
+            op = unpack(commit_log, '=H')[0]
+            for command in Command.__subclasses__():
+                if op == command.opcode:
+                    yield commit_id, command.unpack(commit_log)
 
-    async def flush_loop(self, conn, timeout=10):
+    def dump_commit_log(self):
+        logger.debug('commits log: %s', ['%s - %s' % (commit_id, command) for commit_id, command in self.load_commits()])
+
+    async def flush_loop(self, conn=None, timeout=10):
         try:
             while True:
                 await asyncio.sleep(timeout)
@@ -126,7 +126,10 @@ class Store(MutableMapping):
         except asyncio.CancelledError as e:
             logger.info('--cleanup--')
 
-    def flush(self, conn):
+    def flush(self, conn=None, commit_log=None):
+        conn = conn or self.conn
+        commit_log = commit_log or self.commit_log
+
         if not self.dirty:
             return
 
@@ -135,18 +138,19 @@ class Store(MutableMapping):
             with FLUSH_ERRORS.count_exceptions():
                 self.save_db(conn)
 
-                # clear the commit log
-                self.commit_log.close()
-                self.commit_log = open(self.commit_log_file, 'wb')
+                # truncate commit log
+                commit_log.seek(0)
+                commit_log.truncate()
 
-    def save_db(self, conn):
+    def save_db(self, conn=None):
+        conn = conn or self.conn
         with conn:
             c = conn.cursor()
             c.execute('BEGIN')
 
-            if self.dirty_keys:
+            if self.pending_upsert:
                 values = []
-                for key in self.dirty_keys:
+                for key in self.pending_upsert:
                     NUM_DB_UPSERTS.inc()
                     item = self.data[key]
                     values.append((key, item.flags, item.exptime, item.data))
@@ -156,9 +160,9 @@ class Store(MutableMapping):
                 logger.debug('no values to update')
 
 
-            if self.delete_keys:
+            if self.pending_delete:
                 values = []
-                for key in self.delete_keys:
+                for key in self.pending_delete:
                     NUM_DB_DELETES.inc()
                     logger.debug(key.decode())
                     values.append((key,))
@@ -172,8 +176,9 @@ class Store(MutableMapping):
 
             c.execute('COMMIT')
 
-        self.reset_dirty()
-
+        self.pending_insert.clear()
+        self.pending_update.clear()
+        self.pending_delete.clear()
 
     def apply(self, command):
         ret = command.visit(self)
@@ -191,29 +196,53 @@ class Store(MutableMapping):
         self.commit_log.write(struct.pack('=H', opcode))
         self.commit_log.write(data)
         self.commit_log.flush()
-        os.fsync(self.commit_log.fileno())
+        try:
+            os.fsync(self.commit_log.fileno())
+        except IOError as e:
+            logger.exception('error syncing commit file')
 
     def __setitem__(self, key, value):
         assert isinstance(value, StorageItem)
-        if key in self.data:
-            NUM_KEYS.dec()
+        if key not in self.data:
+            NUM_KEYS.inc()
+            if key not in self.pending_delete:
+                # this means that the key did not exist in the
+                # database, so we want to put it in pending insert
+                self.pending_insert.add(key)
+            else:
+                # this means that the key was in the database
+                # but we have deleted it locally.  in thise case
+                # we want to clear the delete and add it to pending
+                # update
+                self.pending_delete.remove(key)
+                self.pending_update.add(key)
+        else:
+            if key not in self.pending_insert:
+                # this means we are updating a key that was already
+                # in the database (its not pending insert), so we
+                # need to mark the key as pending update
+                self.pending_update.add(key)
             NUM_BYTES.dec(len(self.data[key].data))
-        NUM_KEYS.inc()
         NUM_BYTES.inc(len(value.data))
         self.data[key] = value
-        self.delete_keys.discard(key)
-        self.dirty_keys.add(key)
 
     def __getitem__(self, key):
         return self.data[key]
 
     def __delitem__(self, key):
         value = self.data[key]
-        del self.data[key]
+        if key not in self.pending_insert:
+            # this key was from the database, so much
+            # delete it from the db
+            self.pending_delete.add(key)
+        else:
+            # this key was not in the database and was
+            # pending insert, so we simply remove it from
+            # pending insert
+            self.pending_insert.remove(key)
         NUM_KEYS.dec()
         NUM_BYTES.dec(len(value.data))
-        self.dirty_keys.discard(key)
-        self.delete_keys.add(key)
+        del self.data[key]
 
     def __iter__(self):
         return iter(self.data)

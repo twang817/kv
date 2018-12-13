@@ -103,7 +103,7 @@ class MemcacheServer(object):
         cmd, argv = argv[0], argv[1:]
         cmd = cmd.decode().lower()
         cmd_handler = getattr(self, 'cmd_%s' % cmd, None)
-        if cmd:
+        if cmd_handler:
             with REQUEST_DURATION.labels(cmd).time():
                 with REQUEST_ERRORS.labels(cmd).count_exceptions():
                     return cmd_handler(*argv)
