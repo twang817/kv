@@ -18,3 +18,6 @@ local:
 
 test:
 	pipenv run pytest --cov=.
+
+locust:
+	pipenv run locust -f locustfiles/load_test_set.py -c 10 -r 1 --no-web -t 10
