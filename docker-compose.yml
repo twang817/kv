@@ -1,6 +1,7 @@
 version: '3.2'
 
 services:
+
   nginx:
     image: nginx:latest
     volumes:
@@ -9,6 +10,7 @@ services:
       - 8000:80
     depends_on:
       - server
+
   server:
     image: memcache-server:latest
     command: watchmedo auto-restart -d . -p "*.py" -DR -- python main.py
@@ -19,6 +21,7 @@ services:
     ports:
       - 11211:11211
       - 8080:8080
+
   frontend:
     image: memcache-frontend:latest
     command: npm run serve
@@ -29,6 +32,7 @@ services:
       - ./frontend:/src
     ports:
       - 8081:8081
+
   prometheus:
     image: prom/prometheus:latest
     command:
@@ -41,6 +45,7 @@ services:
       - 9090:9090
     depends_on:
       - cadvisor
+
   cadvisor:
     image: google/cadvisor:latest
     volumes:
@@ -50,6 +55,7 @@ services:
       - /var/lib/docker/:/var/lib/docker:ro
     ports:
       - 9000:8080
+
   node-exporter:
     image: prom/node-exporter
     command:
@@ -63,6 +69,7 @@ services:
       - /:/rootfs:ro
     ports:
       - 9100:9100
+
   grafana:
     image: grafana/grafana:latest
     volumes:
@@ -72,6 +79,31 @@ services:
       - 3000:3000
     depends_on:
       - prometheus
+
+  fluentd:
+    build: ./infra/fluentd
+    ports:
+      - "24224:24224"
+    volumes:
+      - ./infra/fluentd/fluent.conf:/fluentd/etc/fluent.conf
+      - ./logs:/opt/logs
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:6.5.3
+    environment:
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - esdata1:/usr/share/elasticsearch/data
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:6.5.3
+    ports:
+      - "5601:5601"
+    depends_on:
+      - fluentd
+      - elasticsearch
+
 volumes:
   grafana_data:
   prometheus_data:
+  esdata1:

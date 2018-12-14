@@ -249,3 +249,6 @@ class Store(MutableMapping):
 
     def __len__(self):
         return len(self.data)
+
+    def keys(self):
+        return self.data.keys()

@@ -33,12 +33,16 @@ class MemcacheServer(object):
     def __init__(self, store):
         self.store = store
 
-    def cmd_set(self, key, flags, exptime, data, noreply=None):
+    async def cmd_set(self, reader, key, flags, exptime, datalen, noreply=None):
+        datalen = int(datalen)
+        data = await reader.readexactly(datalen + 2)
+        BYTES_IN.inc(len(data))
+        data = data.rstrip(self.sep)
         self.store.apply(SetCommand(key, flags, exptime, data))
         if noreply is None:
             return b'STORED'
 
-    def cmd_get(self, *keys):
+    async def cmd_get(self, reader, *keys):
         resp = []
         for key in keys:
             try:
@@ -51,7 +55,7 @@ class MemcacheServer(object):
         resp.append(b'END')
         return b'\r\n'.join(resp)
 
-    def cmd_delete(self, key, noreply=None):
+    async def cmd_delete(self, reader, key, noreply=None):
         try:
             self.store.apply(DeleteCommand(key))
         except KeyError:
@@ -62,13 +66,13 @@ class MemcacheServer(object):
             if noreply is None:
                 return resp
 
-    def cmd_dump(self):
+    async def cmd_dump(self, reader):
         self.store.apply(DumpCommand())
 
-    def cmd_dumplog(self):
+    async def cmd_dumplog(self, reader):
         self.store.apply(DumpLogCommand())
 
-    def cmd_dumpcommit(self):
+    async def cmd_dumpcommit(self, reader):
         self.store.apply(DumpCommitCommand())
 
     async def handler(self, reader, writer):
@@ -91,14 +95,14 @@ class MemcacheServer(object):
             else:
                 buf = buf.rstrip(self.sep)
                 if buf:
-                    resp = self.dispatch(buf)
+                    resp = await self.dispatch(reader, buf)
                     if resp:
                         writer.write(resp + self.sep)
                         BYTES_OUT.inc(len(resp + self.sep))
                         await writer.drain()
         writer.close()
 
-    def dispatch(self, buf):
+    async def dispatch(self, reader, buf):
         argv = buf.split(b' ')
         cmd, argv = argv[0], argv[1:]
         cmd = cmd.decode().lower()
@@ -106,6 +110,10 @@ class MemcacheServer(object):
         if cmd_handler:
             with REQUEST_DURATION.labels(cmd).time():
                 with REQUEST_ERRORS.labels(cmd).count_exceptions():
-                    return cmd_handler(*argv)
+                    try:
+                        return await cmd_handler(reader, *argv)
+                    except Exception as e:
+                        logger.exception('error processing command {}: {}'.format(cmd, e))
         else:
+            logger.warn('received unknown command: %s', cmd)
             return b'ERROR'

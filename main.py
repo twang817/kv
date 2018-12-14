@@ -12,7 +12,7 @@ import structlog
 import commands
 from server import MemcacheServer
 from store import Store
-from web import webapp
+from web import HttpServer
 
 
 logger = structlog.get_logger(__name__)
@@ -136,6 +136,7 @@ def main(ctx, db, bind, port):
     loop = asyncio.get_event_loop()
 
     server = MemcacheServer(store)
+    web = HttpServer(store)
     flush_task = loop.create_task(
         store.flush_loop(timeout=ctx.default_map['flush_timeout'])
     )
@@ -147,7 +148,7 @@ def main(ctx, db, bind, port):
 
     web_conf = ctx.default_map['web']
     coro = loop.create_server(
-        webapp.make_handler(),
+        web.make_handler(),
         host=web_conf['bind'],
         port=web_conf['port'])
     web_server = loop.run_until_complete(coro)
